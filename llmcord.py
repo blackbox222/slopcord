@@ -1,8 +1,11 @@
+#!/usr/bin/env python3
 import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+import logging.handlers
+import queue
 from typing import Any, Literal, Optional
 
 import discord
@@ -13,9 +16,13 @@ import httpx
 from openai import AsyncOpenAI
 import yaml
 
+log_queue = queue.Queue(-1)
+queue_handler = logging.handlers.QueueHandler(log_queue)
+log_handler = logging.StreamHandler()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=(queue_handler,)
 )
 
 VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "llama", "llava", "mistral", "o3", "o4", "vision", "vl")
@@ -24,9 +31,12 @@ EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 
 STREAMING_INDICATOR = " ⚪"
-EDIT_DELAY_SECONDS = 1
+EDIT_DELAY_SECONDS = 2
 
 MAX_MESSAGE_NODES = 500
+MAX_TOKENS = 1024
+
+EMPTY_THOUGHT = '<|channel>thought\n<channel|>'
 
 
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
@@ -34,11 +44,21 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
         return yaml.safe_load(file)
 
 
+def get_system_prompt() -> str:
+    with open("prompts/system.md", encoding="utf-8") as file:
+        return file.read()
+
+system_prompt = get_system_prompt()
 config = get_config()
 curr_model = next(iter(config["models"]))
 
 msg_nodes = {}
 last_task_time = 0
+
+model_settings = {
+    "temperature": 1.0,
+    "top_p": 0.949999988079071,
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -79,7 +99,6 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
 
     await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
 
-
 @model_command.autocomplete("model")
 async def model_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
     global config
@@ -93,8 +112,33 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
     return choices[:25]
 
 
+@discord_bot.tree.command(name="set", description="Change settings for the model")
+async def set_command(interaction: discord.Interaction, name: str, value: str) -> None:
+    if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
+        if name in model_settings:
+            model_settings[name] = float(value)
+            output = f"Model setting `{name}` updated to: `{value}`"
+            logging.info(output)
+        else:
+            output = f"Unknown model setting: `{name}`. Valid settings are: `{', '.join(model_settings.keys())}`"
+    else:
+        output = "You don't have permission to set model settings."
+
+    await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
+
+@set_command.autocomplete("name")
+async def set_name_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
+    return [Choice(name=f"{setting} (currently {value})", value=setting) for setting, value in model_settings.items() if curr_str.lower() in setting.lower()]
+
+
 @discord_bot.event
 async def on_ready() -> None:
+    config = await asyncio.to_thread(get_config)
+
+    for setting in model_settings.keys():
+        if setting in config:
+            model_settings[setting] = config[setting]
+
     if client_id := config.get("client_id"):
         logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot\n")
 
@@ -106,8 +150,9 @@ async def on_message(new_msg: discord.Message) -> None:
     global last_task_time
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
+    is_mentioned = discord_bot.user in new_msg.mentions or (new_msg.guild and new_msg.guild.self_role in new_msg.role_mentions)
 
-    if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
+    if (not is_dm and not is_mentioned) or new_msg.author.bot:
         return
 
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
@@ -138,6 +183,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
     provider_slash_model = curr_model
     provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
+    human_model_name = model.split("/")[-1].split(":", 1)[0]
 
     provider_config = config["providers"][provider]
 
@@ -155,7 +201,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
     max_text = config.get("max_text", 100000)
     max_images = config.get("max_images", 5) if accept_images else 0
-    max_messages = config.get("max_messages", 25)
+    max_messages = config.get("max_messages", 50)
 
     # Build message chain and set user warnings
     messages = []
@@ -167,7 +213,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
         async with curr_node.lock:
             if curr_node.text == None:
-                cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
+                cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).replace(EMPTY_THOUGHT, "").lstrip()
 
                 good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
 
@@ -193,6 +239,8 @@ async def on_message(new_msg: discord.Message) -> None:
 
                 curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
 
+                is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
+
                 try:
                     if (
                         curr_msg.reference == None
@@ -203,7 +251,6 @@ async def on_message(new_msg: discord.Message) -> None:
                     ):
                         curr_node.parent_msg = prev_msg_in_channel
                     else:
-                        is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
                         parent_is_thread_start = is_public_thread and curr_msg.reference == None and curr_msg.channel.parent.type == discord.ChannelType.text
 
                         if parent_msg_id := curr_msg.channel.id if parent_is_thread_start else getattr(curr_msg.reference, "message_id", None):
@@ -233,14 +280,30 @@ async def on_message(new_msg: discord.Message) -> None:
             if curr_node.fetch_parent_failed or (curr_node.parent_msg != None and len(messages) == max_messages):
                 user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
 
-            curr_msg = curr_node.parent_msg
+            if curr_msg.type == discord.MessageType.reply or is_public_thread:
+                curr_msg = curr_node.parent_msg
+            else:
+                break
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
-    if system_prompt := config.get("system_prompt"):
+    temperature = model_settings.get("temperature", 1.0)
+    top_p = model_settings.get("top_p", 0.949999988079071)
+
+    if system_prompt := await asyncio.to_thread(get_system_prompt):
         now = datetime.now().astimezone()
 
-        system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+        replacements = {
+            '{date}': now.strftime("%B %d %Y"),
+            '{time}': now.strftime("%H:%M:%S %Z%z"),
+            '{name}': discord_bot.user.name,
+            '{model_name}': human_model_name,
+            '{model_temperature}': str(temperature),
+            '{model_top_p}': str(top_p),
+        }
+        for key, value in replacements.items():
+            system_prompt = system_prompt.replace(key, value)
+        system_prompt = system_prompt.strip()
 
         messages.append(dict(role="system", content=system_prompt))
 
@@ -248,8 +311,6 @@ async def on_message(new_msg: discord.Message) -> None:
     curr_content = finish_reason = None
     response_msgs = []
     response_contents = []
-
-    openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
 
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
@@ -267,7 +328,13 @@ async def on_message(new_msg: discord.Message) -> None:
 
     try:
         async with new_msg.channel.typing():
-            async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
+            async for chunk in await openai_client.chat.completions.create(
+                model=model, messages=messages[::-1], stream=True,
+                extra_headers=extra_headers, extra_query=extra_query,
+                extra_body=extra_body, temperature=temperature, top_p=top_p,
+                max_tokens=MAX_TOKENS, max_completion_tokens=MAX_TOKENS):
+
+                logging.info(f"Received chunk: {chunk}")
                 if finish_reason != None:
                     break
 
@@ -300,6 +367,7 @@ async def on_message(new_msg: discord.Message) -> None:
                     if start_next_msg or ready_to_edit or is_final_edit:
                         embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
                         embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+                        embed.description = embed.description.replace(EMPTY_THOUGHT, '')
 
                         if start_next_msg:
                             await reply_helper(embed=embed, silent=True)
@@ -311,7 +379,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
             if use_plain_responses:
                 for content in response_contents:
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content.replace(EMPTY_THOUGHT, ''))))
 
     except Exception:
         logging.exception("Error while generating response")
@@ -328,10 +396,12 @@ async def on_message(new_msg: discord.Message) -> None:
 
 
 async def main() -> None:
-    await discord_bot.start(config["bot_token"])
+    with logging.handlers.QueueListener(log_queue, log_handler):
+        await discord_bot.start(config["bot_token"])
 
 
-try:
-    asyncio.run(main())
-except KeyboardInterrupt:
-    pass
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
