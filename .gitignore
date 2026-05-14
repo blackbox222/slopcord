@@ -17,4 +17,5 @@ prompts/*
 !config-example.yaml
 !docker-compose.yaml
 !pyproject.toml
+!tools.yaml
 !uv.lock

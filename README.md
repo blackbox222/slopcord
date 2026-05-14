@@ -14,9 +14,14 @@ Let an LLM **vibe-delete** your Discord friends' home directory with tool callin
   <img src="https://github.com/user-attachments/assets/7791cc6b-6755-484f-a9e3-0707765b081f" alt="">
 </p>
 
-slopcord, based on llmcord, transforms Discord into a collaborative LLM frontend. It works with practically any LLM, remote or locally hosted.
+slopcord, based on llmcord, transforms Discord into a collaborative LLM frontend for vibe coding and content writing. It works with practically any LLM, remote or locally hosted.
 
-slopcord adds some new commands and **the ability to load system prompts from files.**
+slopcord is a restructuring of the llmcord code with many enhancements:
+- Ability to load system prompts from files (and switch between them using `/system-prompt`)
+- Better logging/error reporting
+- Tool calls and responses as simple Python functions, with a set of default "ask" tools from VSCode's Copilot extension:
+  - list_dir
+  - read_file
 
 ## Features
 
@@ -118,8 +123,9 @@ uv run -m slopcord
 
 ### Flags
 
-* `--config FILE.yaml`: alternate config.yaml to use
-* `--invisible`: optional
+* `--config config.yaml`: alternate config.yaml to use
+* `--invisible`: Whether to set status to invisible - optional, default false
+* `--tools-config tools.yaml`: alternate tools schema to use
 
 ---
 

@@ -13,7 +13,7 @@ from typing import Any
 import discord
 import openai
 
-from . import constants, formatters, globals, llm, messages, permissions
+from . import constants, formatters, globals, llm, messages, permissions, tools
 
 log = logging.getLogger(__name__)
 
@@ -64,13 +64,14 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
         cur_reply: discord.Message | None = None
         cur_reply_lock = asyncio.Lock()
         last_update_time = 0.0
-        tool_names: defaultdict[str, str] = defaultdict(str)
-        tool_args: defaultdict[str, io.StringIO] = defaultdict(io.StringIO)
         tool_messages = []
         parent_msg = msg
         start_time = time.time()
 
         for i in range(5):
+            tool_names: defaultdict[str, str] = defaultdict(str)
+            tool_args: defaultdict[str, io.StringIO] = defaultdict(io.StringIO)
+
             # Fetch message chain
             msg_chain = messages.MessageChain(ctx, parent_msg)
             await msg_chain.build()
@@ -116,6 +117,7 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                     model_params=model_parameters,
                     system_prompt=system_prompt,
                     messages=msg_chain.messages,
+                    tool_defs=ctx.tools_config,
                     tool_messages=tool_messages
                 ):
                     if response.finish_reason:
@@ -133,8 +135,7 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                             await _update(
                                 formatters.format_embed(
                                     text.getvalue(), "message_split", usage,
-                                    tool_name=tool_names[tool_id] if tool_id else None,
-                                    tool_args=tool_args[tool_id].getvalue() if tool_id else None),
+                                    tool_names=tool_names, tool_args=tool_args),
                                 final_edit=True)
                             text = io.StringIO()
                             tool_args[tool_id] = io.StringIO()
@@ -153,8 +154,7 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                                     await _update(
                                         formatters.format_embed(
                                             text.getvalue(), "message_split", usage,
-                                            tool_name=tool_names[tool_id] if tool_id else None,
-                                            tool_args=tool_args[tool_id].getvalue() if tool_id else None),
+                                            tool_names=tool_names, tool_args=tool_args),
                                         final_edit=True)
                                     text = io.StringIO()
                                     tool_args[tool_id] = io.StringIO()
@@ -170,8 +170,7 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                         await _update(
                             formatters.format_embed(
                                 text.getvalue(), finish_reason, usage,
-                                tool_name=tool_names[tool_id] if tool_id else None,
-                                tool_args=tool_args[tool_id].getvalue() if tool_id else None))
+                                tool_names=tool_names, tool_args=tool_args))
 
                 # Trigger a final update to avoid missing any updates that were rate limited
                 elapsed = time.time() - start_time
@@ -179,8 +178,7 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                 await _update(
                     formatters.format_embed(
                         text.getvalue(), finish_reason, usage, elapsed,
-                        tool_names[tool_id] if tool_id else None,
-                        tool_args[tool_id].getvalue() if tool_id else None))
+                        tool_names, tool_args))
                 if cur_reply:
                     parent_msg = cur_reply
                     cur_reply = None
@@ -189,7 +187,10 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                 if response.finish_reason == "tool_calls":
                     for id, name in tool_names.items():
                         log.info("handling tool call %s for tool %s: %s", id, name, tool_args[id].getvalue())
-                        tool_messages.append(dict(role="tool", content=f"ERROR: not implemented yet", tool_call_id=id))
+                        message = tools.call_tool(ctx, name, tool_args[id].getvalue())
+                        message_lines = message.split('\n')
+                        log.info("tool %s returned message: %s%s", name, message_lines[0], f" ({len(message_lines) - 1} more lines)" if len(message_lines) > 1 else "")
+                        tool_messages.append(dict(role="tool", content=message, tool_call_id=id))
                 else:
                     break
 

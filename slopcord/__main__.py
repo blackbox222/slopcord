@@ -11,13 +11,14 @@ import discord
 from discord.ext import commands
 import httpx
 
-from . import commands as cmd_module, configs, events, globals
+from . import commands as cmd_module, configs, events, globals, tools
 
 
 async def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--invisible", action='store_true', default=False)
+    parser.add_argument("--tools_config", default="tools.yaml")
     args = parser.parse_args(argv)
 
     # Configure logging with a queue to avoid blocking the event loop
@@ -49,6 +50,7 @@ async def main(argv: list[str]) -> int:
         # Make the first model the default
         model_name = next(iter(config.data.get("models", {})))
         bot_context = globals.BotContext(bot, config, httpx_client, model_name)
+        tools.load_tools(bot_context, args.tools_config)
 
         # Register commands
         cmd_module.register_commands(bot_context, model_name)

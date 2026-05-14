@@ -6,11 +6,11 @@ Handles embeds, TextDisplay, message splitting, and reply logic.
 from datetime import datetime
 import logging
 import io
-from typing import Any
+from typing import Any, Iterable
 
 import discord
 
-from . import constants
+from . import constants, tools
 
 log = logging.getLogger(__name__)
 
@@ -24,8 +24,9 @@ def format_embed(
         finish_reason: str | None = None,
         usage: tuple[int, int] | None = None,
         elapsed_sec: float | None = None,
-        tool_name: str | None = None,
-        tool_args: str | None = None) -> discord.Embed:
+        tool_names: dict[str, str] | None = None,
+        tool_args: dict[str, io.StringIO] | None = None,
+        warnings: set[str] | None = None) -> discord.Embed:
     """Format an LLM response into a Discord embed."""
 
     desc = io.StringIO()
@@ -45,10 +46,18 @@ def format_embed(
         description=desc.getvalue(),
         color=color)
 
-    if tool_name and tool_args:
-        field_name = f"{constants.TOOL_INDICATOR} calling `{tool_name}`"
-        field_value = f"`{tool_args}`"
-        embed.add_field(name=field_name, value=field_value, inline=False)
+    if tool_names and tool_args:
+        for id in tool_names.keys():
+            if id:
+                tool_name = tool_names[id]
+                args = tool_args[id].getvalue()
+                tool_desc, tool_detail = tools.describe_tool_call(tool_name, args)
+
+                embed.add_field(name=f"{constants.TOOL_INDICATOR} {tool_desc}", value=tool_detail, inline=False)
+
+    if warnings:
+        for warning in warnings:
+            embed.add_field(name=warning, value="", inline=False)
 
     footer_parts = []
     if finish_reason:

@@ -32,7 +32,8 @@ async def generate(
     model_params: dict[str, Any],
     system_prompt: str,
     messages: list[dict[str, Any]],
-    tool_messages: list[dict[str, Any]]
+    tool_defs: list[Any],
+    tool_messages: list[dict[str, Any]],
 ) -> AsyncGenerator[Response]:
     """Generate responses from the LLM, yielding updated Response objects as new chunks arrive."""
     system_turns = [dict(content=system_prompt, role="system")]
@@ -48,7 +49,7 @@ async def generate(
         response_format="json_object",
         stream=True,
         stream_options=dict(include_usage=True),
-        tools=tools.TOOLS,
+        tools=tool_defs,
         tool_choice="auto",
 
         **(model_params or {}),
